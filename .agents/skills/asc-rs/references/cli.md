@@ -43,6 +43,27 @@ Examples:
 <asc> getclass --engine jadx --jadx-path C:\tools\jadx\bin\jadx.bat app.apk com.example.Main
 ```
 
+## Decompile every class
+
+```text
+<asc> decompile-all [--debug] [--threads N] [--format text|json] \
+  [-m restructure|simple|fallback] [-o DIR] APK
+```
+
+Writes the whole APK as a Java source tree using the built-in Rust engine
+(there is no `--engine` option; for a JADX full dump run `jadx` directly).
+`-o DIR` selects the output directory and defaults to the current directory.
+Each class lands at `DIR/<package path>/<Class>.java`; `simple` is the default
+mode. Standalone DEX files are parsed once and decompiled in parallel; DEX 041
+container sub-files go through the same minimal-DEX rebuild as `getclass`.
+Classes that fail to decompile are reported individually and skipped instead
+of aborting the run.
+
+```powershell
+<asc> decompile-all -o sources app.apk
+<asc> decompile-all -m restructure -o sources app.apk
+```
+
 ## Find bytecode references
 
 Parent options are `--debug`, `--threads N`, `--format text|json`, and
@@ -124,8 +145,9 @@ Ranges that extend past the entry fail instead of silently truncating.
 
 ## Structured output
 
-`getclass`, `findrefs`, `manifest`, `classes`, `entries`, and non-raw `entry`
-accept `--format json`. The JSON form preserves reference indexes, bytecode
+`getclass`, `findrefs`, `manifest`, `classes`, `decompile-all`, `entries`,
+and non-raw `entry` accept `--format json`. The JSON form preserves reference
+indexes, bytecode
 offsets, DEX summaries, timings, and class/minimal-DEX metadata where relevant.
 Diagnostics from `--debug` remain on stderr so stdout stays machine-readable.
 

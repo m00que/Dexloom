@@ -4,20 +4,21 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::{Command, Output},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{Arc, atomic::{AtomicUsize, Ordering}},
     time::Instant,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use axml_parser::AXMLPrinter;
 pub use dex_decompiler::DecompilationMode;
-use dex_decompiler::{Decompiler, DecompilerOptions, parse_dex};
+use dex_decompiler::{ClassDef, Decompiler, DecompilerOptions, DexFile, parse_dex};
 use rayon::prelude::*;
 
 use crate::{
     apk::{ApkSession, DexEntry},
     descriptor_to_java,
-    dex::{Query, ReferenceKind, StringBatchMatcher},
+    dex::{Query, ReferenceKind, StringBatchMatcher, class_descriptors_at},
+    dex_container::logical_dexes,
     format_class_name,
     minidex::{MinimalDexStats, extract_minimal_dex_at},
 };
@@ -169,6 +170,37 @@ pub struct BatchReferenceSearchResult {
     pub dexes: Vec<BatchDexSearchSummary>,
     pub timings: SearchTimings,
 }
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DecompileAllTimings {
+    pub load_ms: f64,
+    pub decompile_ms: f64,
+    pub total_ms: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct DecompileAllFailure {
+    pub dex_name: String,
+    pub descriptor: String,
+    pub error: String,
+}
+
+#[derive(Debug)]
+pub struct DecompileAllResult {
+    pub dexes: usize,
+    pub total_classes: usize,
+    pub written: usize,
+    pub failures: Vec<DecompileAllFailure>,
+    pub timings: DecompileAllTimings,
+}
+
+/// One standalone DEX parsed by the builtin engine: its logical name, the
+/// shared parse, and every `(descriptor, class definition)` pair it defines.
+type ParsedStandaloneDex = (String, Arc<DexFile>, Vec<(String, ClassDef)>);
+
+/// One DEX 041 logical sub-file: name, container bytes, header offset within
+/// the container, and the descriptors it defines.
+type ParsedContainerDex = (String, Arc<[u8]>, usize, Vec<String>);
 
 pub struct AscSession {
     apk: ApkSession,
@@ -515,6 +547,257 @@ impl AscSession {
             },
         })
     }
+
+    /// Decompile every class in the APK into a Java source tree under
+    /// `output_dir`. Per-class failures are collected instead of aborting.
+    pub fn decompile_all(
+        &self,
+        output_dir: &Path,
+        mode: DecompilationMode,
+    ) -> Result<DecompileAllResult> {
+        self.decompile_all_with_observer(output_dir, mode, &NoopObserver)
+    }
+
+    pub fn decompile_all_with_observer(
+        &self,
+        output_dir: &Path,
+        mode: DecompilationMode,
+        observer: &dyn OperationObserver,
+    ) -> Result<DecompileAllResult> {
+        let started = Instant::now();
+        check_cancelled(observer)?;
+        observer.on_progress(&ProgressEvent {
+            stage: OperationStage::Loading,
+            completed: 0,
+            total: self.apk.dex_info().len(),
+            item: None,
+        });
+        let physical = self.apk.load_all_dexes()?;
+        let mut standalone = Vec::new();
+        let mut containers = Vec::new();
+        for entry in &physical {
+            for logical in logical_dexes(&entry.name, &entry.data)? {
+                if logical.header_offset == 0 {
+                    standalone.push((logical.name, entry.data.clone()));
+                } else {
+                    containers.push((logical.name, entry.data.clone(), logical.header_offset));
+                }
+            }
+        }
+
+        // Parse each standalone DEX once and share the DexFile across worker
+        // threads, each owning its own non-Sync Decompiler. DEX 041 sub-files
+        // keep container-absolute offsets, so they go through the per-class
+        // minimal-DEX rebuild instead of a shared parse.
+        let parsed: Vec<ParsedStandaloneDex> =
+            self.apk.install(|| {
+                standalone
+                    .into_par_iter()
+                    .map(|(name, data)| {
+                        let parsed = parse_dex(&data)
+                            .map_err(|error| anyhow!(error.to_string()))
+                            .with_context(|| format!("Androguard dex-parser rejected {name}"))?;
+                        let mut classes = Vec::new();
+                        for class_def in parsed.class_defs() {
+                            let class_def = class_def
+                                .map_err(|error| anyhow!(error.to_string()))
+                                .context("failed to read class definition")?;
+                            let descriptor = parsed
+                                .get_type(class_def.class_idx)
+                                .map_err(|error| anyhow!(error.to_string()))
+                                .context("failed to resolve class descriptor")?;
+                            classes.push((descriptor, class_def));
+                        }
+                        Ok((name, Arc::new(parsed), classes))
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })?;
+        let containers: Vec<ParsedContainerDex> = containers
+            .into_iter()
+            .map(|(name, data, header_offset)| {
+                let descriptors = class_descriptors_at(&data, header_offset)
+                    .with_context(|| format!("failed to list classes in {name}"))?;
+                Ok((name, data, header_offset, descriptors))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let dex_count = parsed.len() + containers.len();
+        let total_classes = parsed
+            .iter()
+            .map(|(_, _, classes)| classes.len())
+            .sum::<usize>()
+            + containers
+                .iter()
+                .map(|(_, _, _, descriptors)| descriptors.len())
+                .sum::<usize>();
+        let loaded = Instant::now();
+        observer.on_progress(&ProgressEvent {
+            stage: OperationStage::Loading,
+            completed: dex_count,
+            total: dex_count,
+            item: None,
+        });
+        check_cancelled(observer)?;
+
+        let workers = self.apk.install(rayon::current_num_threads).max(1);
+        let completed = AtomicUsize::new(0);
+        enum Job<'a> {
+            Standalone {
+                dex_name: &'a str,
+                parsed: &'a DexFile,
+                chunk: &'a [(String, ClassDef)],
+            },
+            Container {
+                dex_name: &'a str,
+                data: &'a [u8],
+                header_offset: usize,
+                descriptors: &'a [String],
+            },
+        }
+        let mut jobs = Vec::new();
+        for (name, dex, classes) in &parsed {
+            let chunk_size = classes.len().div_ceil(workers);
+            for chunk in classes.chunks(chunk_size) {
+                jobs.push(Job::Standalone {
+                    dex_name: name,
+                    parsed: dex,
+                    chunk,
+                });
+            }
+        }
+        for (name, data, header_offset, descriptors) in &containers {
+            jobs.push(Job::Container {
+                dex_name: name,
+                data,
+                header_offset: *header_offset,
+                descriptors,
+            });
+        }
+
+        type JobOutcome = (usize, Vec<DecompileAllFailure>);
+        let outcomes: Vec<Result<JobOutcome>> = self.apk.install(|| {
+            jobs.par_iter()
+                .map(|job| {
+                    let mut written = 0;
+                    let mut failures = Vec::new();
+                    let record = |descriptor: &str,
+                                      result: Result<String>,
+                                      dex_name: &str,
+                                      failures: &mut Vec<DecompileAllFailure>,
+                                      written: &mut usize| match result {
+                        Ok(source) => match write_java_source(output_dir, descriptor, &source) {
+                            Ok(()) => *written += 1,
+                            Err(error) => failures.push(DecompileAllFailure {
+                                dex_name: dex_name.to_owned(),
+                                descriptor: descriptor.to_owned(),
+                                error: format!("{error:#}"),
+                            }),
+                        },
+                        Err(error) => failures.push(DecompileAllFailure {
+                            dex_name: dex_name.to_owned(),
+                            descriptor: descriptor.to_owned(),
+                            error: format!("{error:#}"),
+                        }),
+                    };
+
+                    let job_name = match job {
+                        Job::Standalone { dex_name, .. } | Job::Container { dex_name, .. } => {
+                            *dex_name
+                        }
+                    };
+                    match job {
+                        Job::Standalone {
+                            dex_name: _,
+                            parsed,
+                            chunk,
+                        } => {
+                            let decompiler = Decompiler::with_options(
+                                parsed,
+                                DecompilerOptions {
+                                    mode,
+                                    resource_map: Some(Default::default()),
+                                    ..DecompilerOptions::default()
+                                },
+                            );
+                            for (descriptor, class_def) in chunk.iter() {
+                                check_cancelled(observer)?;
+                                record(
+                                    descriptor,
+                                    decompile_parsed_class(parsed, &decompiler, class_def, descriptor),
+                                    job_name,
+                                    &mut failures,
+                                    &mut written,
+                                );
+                                observer.on_progress(&ProgressEvent {
+                                    stage: OperationStage::Decompiling,
+                                    completed: completed.fetch_add(1, Ordering::Relaxed) + 1,
+                                    total: total_classes,
+                                    item: Some(job_name.to_owned()),
+                                });
+                            }
+                        }
+                        Job::Container {
+                            data,
+                            header_offset,
+                            descriptors,
+                            ..
+                        } => {
+                            for descriptor in descriptors.iter() {
+                                check_cancelled(observer)?;
+                                let result = extract_minimal_dex_at(
+                                    data,
+                                    *header_offset,
+                                    descriptor,
+                                )
+                                .and_then(|minimal| {
+                                    decompile_minimal_builtin(
+                                        job_name,
+                                        &minimal.bytes,
+                                        descriptor,
+                                        mode,
+                                    )
+                                });
+                                record(
+                                    descriptor,
+                                    result,
+                                    job_name,
+                                    &mut failures,
+                                    &mut written,
+                                );
+                                observer.on_progress(&ProgressEvent {
+                                    stage: OperationStage::Decompiling,
+                                    completed: completed.fetch_add(1, Ordering::Relaxed) + 1,
+                                    total: total_classes,
+                                    item: Some(job_name.to_owned()),
+                                });
+                            }
+                        }
+                    }
+                    Ok((written, failures))
+                })
+                .collect()
+        });
+
+        let mut written = 0;
+        let mut failures = Vec::new();
+        for outcome in outcomes {
+            let (job_written, mut job_failures) = outcome?;
+            written += job_written;
+            failures.append(&mut job_failures);
+        }
+        let finished = Instant::now();
+        check_cancelled(observer)?;
+        Ok(DecompileAllResult {
+            dexes: dex_count,
+            total_classes,
+            written,
+            failures,
+            timings: DecompileAllTimings {
+                load_ms: (loaded - started).as_secs_f64() * 1000.0,
+                decompile_ms: (finished - loaded).as_secs_f64() * 1000.0,
+                total_ms: (finished - started).as_secs_f64() * 1000.0,
+            },
+        })
+    }
 }
 
 pub fn decode_manifest(apk_path: impl AsRef<Path>, pretty: bool) -> Result<String> {
@@ -559,7 +842,7 @@ fn decompile_minimal(
 ) -> Result<String> {
     match options.engine {
         DecompilationEngine::Builtin => {
-            decompile_minimal_builtin(entry, bytes, descriptor, options.mode)
+            decompile_minimal_builtin(&entry.name, bytes, descriptor, options.mode)
         }
         DecompilationEngine::Jadx => decompile_minimal_jadx(
             bytes,
@@ -571,21 +854,21 @@ fn decompile_minimal(
 }
 
 fn decompile_minimal_builtin(
-    entry: &DexEntry,
+    dex_name: &str,
     bytes: &[u8],
     descriptor: &str,
     mode: DecompilationMode,
 ) -> Result<String> {
     let parsed = parse_dex(bytes)
-        .map_err(|error| anyhow::anyhow!(error.to_string()))
-        .with_context(|| format!("Androguard dex-parser rejected rebuilt {}", entry.name))?;
+        .map_err(|error| anyhow!(error.to_string()))
+        .with_context(|| format!("Androguard dex-parser rejected rebuilt {dex_name}"))?;
     for class_def in parsed.class_defs() {
         let class_def = class_def
-            .map_err(|error| anyhow::anyhow!(error.to_string()))
+            .map_err(|error| anyhow!(error.to_string()))
             .context("failed to read class definition")?;
         let class_type = parsed
             .get_type(class_def.class_idx)
-            .map_err(|error| anyhow::anyhow!(error.to_string()))
+            .map_err(|error| anyhow!(error.to_string()))
             .context("failed to resolve class descriptor")?;
         if class_type != descriptor {
             continue;
@@ -596,46 +879,57 @@ fn decompile_minimal_builtin(
             ..DecompilerOptions::default()
         };
         let decompiler = Decompiler::with_options(&parsed, options);
-        let mut source = decompiler
-            .decompile_class(&class_def)
-            .map_err(|error| anyhow::anyhow!(error.to_string()))
-            .with_context(|| format!("failed to decompile {}", descriptor_to_java(descriptor)))?;
-
-        if let Some(class_data) = parsed
-            .get_class_data(&class_def)
-            .map_err(|error| anyhow::anyhow!(error.to_string()))?
-        {
-            let class_name = descriptor_to_java(descriptor);
-            let simple_name = class_name.rsplit('.').next().unwrap_or(&class_name);
-            let mut restored = String::new();
-            for method in class_data
-                .direct_methods
-                .iter()
-                .chain(class_data.virtual_methods.iter())
-            {
-                let info = parsed
-                    .get_method_info(method.method_idx)
-                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-                let hidden = method.access_flags & 0x40 != 0
-                    || (info.name.starts_with("access$") && method.access_flags & 0x1000 != 0)
-                    || info.name.starts_with("$r8$lambda$");
-                if hidden {
-                    restored.push_str(
-                        &decompiler
-                            .decompile_method(method, Some(simple_name), Some(&class_name))
-                            .map_err(|error| anyhow::anyhow!(error.to_string()))?,
-                    );
-                }
-            }
-            if !restored.is_empty() {
-                let insert_at = source.rfind("\n}").unwrap_or(source.len());
-                restored.insert(0, '\n');
-                source.insert_str(insert_at, &restored);
-            }
-        }
-        return Ok(repair_double_encoded_utf8(source));
+        return decompile_parsed_class(&parsed, &decompiler, &class_def, descriptor);
     }
     bail!("class {descriptor} was located but dex-decompiler could not resolve it")
+}
+
+/// Decompile one class definition from an already-parsed standalone DEX,
+/// restoring compiler-synthesized members and repairing double-encoded UTF-8.
+fn decompile_parsed_class(
+    parsed: &DexFile,
+    decompiler: &Decompiler<'_>,
+    class_def: &ClassDef,
+    descriptor: &str,
+) -> Result<String> {
+    let mut source = decompiler
+        .decompile_class(class_def)
+        .map_err(|error| anyhow!(error.to_string()))
+        .with_context(|| format!("failed to decompile {}", descriptor_to_java(descriptor)))?;
+
+    if let Some(class_data) = parsed
+        .get_class_data(class_def)
+        .map_err(|error| anyhow!(error.to_string()))?
+    {
+        let class_name = descriptor_to_java(descriptor);
+        let simple_name = class_name.rsplit('.').next().unwrap_or(&class_name);
+        let mut restored = String::new();
+        for method in class_data
+            .direct_methods
+            .iter()
+            .chain(class_data.virtual_methods.iter())
+        {
+            let info = parsed
+                .get_method_info(method.method_idx)
+                .map_err(|error| anyhow!(error.to_string()))?;
+            let hidden = method.access_flags & 0x40 != 0
+                || (info.name.starts_with("access$") && method.access_flags & 0x1000 != 0)
+                || info.name.starts_with("$r8$lambda$");
+            if hidden {
+                restored.push_str(
+                    &decompiler
+                        .decompile_method(method, Some(simple_name), Some(&class_name))
+                        .map_err(|error| anyhow!(error.to_string()))?,
+                );
+            }
+        }
+        if !restored.is_empty() {
+            let insert_at = source.rfind("\n}").unwrap_or(source.len());
+            restored.insert(0, '\n');
+            source.insert_str(insert_at, &restored);
+        }
+    }
+    Ok(repair_double_encoded_utf8(source))
 }
 
 fn decompile_minimal_jadx(
@@ -757,6 +1051,33 @@ fn repair_double_encoded_utf8(mut text: String) -> String {
     text
 }
 
+/// Map a Java class name onto `<output_dir>/<package path>/<Class>.java`.
+/// Malformed names that could escape the output directory or that cannot be
+/// used as a file name on Windows are rejected.
+fn java_source_path(output_dir: &Path, java_name: &str) -> Result<PathBuf> {
+    for segment in java_name.split('.') {
+        if segment.is_empty() || segment == ".." {
+            bail!("class name {java_name:?} would escape the output directory");
+        }
+    }
+    if java_name
+        .bytes()
+        .any(|byte| matches!(byte, b'\\' | b':' | b'*' | b'?' | b'"' | b'<' | b'>' | b'|' | 0))
+    {
+        bail!("class name {java_name:?} contains characters unsafe for file names");
+    }
+    Ok(output_dir.join(format!("{}.java", java_name.replace('.', std::path::MAIN_SEPARATOR_STR))))
+}
+
+fn write_java_source(output_dir: &Path, descriptor: &str, source: &str) -> Result<()> {
+    let path = java_source_path(output_dir, &descriptor_to_java(descriptor))?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(&path, source).with_context(|| format!("failed to write {}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -773,5 +1094,24 @@ mod tests {
     fn cancellation_is_checked_before_io() {
         let error = decode_manifest_with_observer("missing.apk", true, &Cancelled).unwrap_err();
         assert_eq!(error.to_string(), "operation cancelled");
+    }
+
+    #[test]
+    fn java_source_paths_follow_packages_and_reject_traversal() {
+        let path = java_source_path(Path::new("out"), "com.example.Foo$Bar").unwrap();
+        assert_eq!(
+            path,
+            Path::new("out").join(format!(
+                "com{sep}example{sep}Foo$Bar.java",
+                sep = std::path::MAIN_SEPARATOR
+            ))
+        );
+        assert_eq!(
+            java_source_path(Path::new("out"), "Root").unwrap(),
+            Path::new("out").join("Root.java")
+        );
+        for hostile in ["..Evil", "com..Evil", "com.", "com.Evil\\Name", "com.Evil:Name"] {
+            assert!(java_source_path(Path::new("out"), hostile).is_err(), "{hostile}");
+        }
     }
 }

@@ -45,6 +45,8 @@ enum Commands {
     Entry(EntryArgs),
     /// List or search class definitions across every classes*.dex.
     Classes(ClassesArgs),
+    /// Decompile every class into a Java source tree (built-in Rust engine).
+    DecompileAll(DecompileAllArgs),
 }
 
 #[derive(Debug, Args)]
@@ -146,6 +148,20 @@ struct ClassesArgs {
     /// Keep descriptors containing this value; Java dots become slashes.
     #[arg(long)]
     contains: Option<String>,
+    /// Input APK path.
+    apk_path: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct DecompileAllArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+    /// Directory that receives the <package path>/<Class>.java tree.
+    #[arg(short, long, default_value = ".")]
+    output: PathBuf,
+    /// Backend strategy (default: simple).
+    #[arg(short = 'm', long, value_enum)]
+    decompilation_mode: Option<ModeArg>,
     /// Input APK path.
     apk_path: PathBuf,
 }
@@ -272,6 +288,7 @@ fn run() -> Result<()> {
         Commands::Entries(args) => entries(args),
         Commands::Entry(args) => entry(args),
         Commands::Classes(args) => classes(args),
+        Commands::DecompileAll(args) => decompile_all(args),
     }
 }
 
@@ -404,6 +421,69 @@ fn classes(args: ClassesArgs) -> Result<()> {
         eprintln!(
             "[DEBUG] Total: {:.3} ms",
             started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+    Ok(())
+}
+
+fn decompile_all(args: DecompileAllArgs) -> Result<()> {
+    let mode = args.decompilation_mode.unwrap_or(ModeArg::Simple);
+    let session = AscSession::open(&args.apk_path, args.common.threads)?;
+    let result = session.decompile_all(&args.output, mode.into())?;
+    match args.common.format {
+        OutputFormatArg::Text => {
+            println!(
+                "Decompiled {}/{} classes from {} DEX file(s) into {}",
+                result.written,
+                result.total_classes,
+                result.dexes,
+                args.output.display()
+            );
+            const SHOWN_FAILURES: usize = 20;
+            for failure in result.failures.iter().take(SHOWN_FAILURES) {
+                println!("[FAIL] {} ({}): {}", failure.descriptor, failure.dex_name, failure.error);
+            }
+            if result.failures.len() > SHOWN_FAILURES {
+                println!(
+                    "... and {} more failures",
+                    result.failures.len() - SHOWN_FAILURES
+                );
+            }
+        }
+        OutputFormatArg::Json => {
+            write_json(
+                &json!({
+                    "apk": args.apk_path.display().to_string(),
+                    "output": args.output.display().to_string(),
+                    "mode": mode.label(),
+                    "dexes": result.dexes,
+                    "total_classes": result.total_classes,
+                    "written": result.written,
+                    "failures": result
+                        .failures
+                        .iter()
+                        .map(|failure| {
+                            json!({
+                                "dex": failure.dex_name,
+                                "class": failure.descriptor,
+                                "error": failure.error,
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                    "timings_ms": {
+                        "load": result.timings.load_ms,
+                        "decompile": result.timings.decompile_ms,
+                        "total": result.timings.total_ms,
+                    },
+                }),
+                None,
+            )?;
+        }
+    }
+    if args.common.debug {
+        eprintln!(
+            "[DEBUG] Load: {:.3} ms, decompile: {:.3} ms, total: {:.3} ms",
+            result.timings.load_ms, result.timings.decompile_ms, result.timings.total_ms
         );
     }
     Ok(())

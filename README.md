@@ -62,6 +62,8 @@ manifest task and let Codex select it automatically. The layout follows the
 asc-rs getclass app.apk com.example.Main -o Main.java
 asc-rs getclass --engine jadx app.apk com.example.Main -o Main.java
 asc-rs getclass --engine jadx --jadx-path C:\tools\jadx\bin\jadx.bat app.apk com.example.Main
+asc-rs decompile-all app.apk
+asc-rs decompile-all -m restructure -o sources app.apk
 asc-rs findrefs app.apk string Authorization
 asc-rs findrefs app.apk strings Authorization token api.example.com
 asc-rs findrefs app.apk type com.example.Main
@@ -87,6 +89,14 @@ The `strings` form accepts one or more patterns and scans each DEX string table
 once with a shared multi-pattern matcher. Its output stays grouped by query;
 overlapping, repeated, and empty patterns have the same semantics as separate
 `string` searches.
+
+`decompile-all` is the whole-APK counterpart of `getclass`: it writes every
+class as `<output>/<package path>/<Class>.java` using the built-in Rust engine
+(`-o` selects the directory and defaults to the current directory). Standalone
+DEX files are parsed once and their classes are split across the worker pool;
+DEX 041 container sub-files reuse the per-class minimal-DEX rebuild. Classes
+that fail to decompile are reported and skipped instead of aborting the run.
+For a full JADX dump, run the JADX CLI directly on the APK.
 
 Reference results include complete Dalvik method and field signatures. The
 library's structured results additionally retain the caller and target indexes
@@ -126,6 +136,10 @@ let jadx_class = session.decompile_class_with_options(
 )?;
 let references = session.find_references(
     &Query::String("Authorization".to_owned()),
+)?;
+let dump = session.decompile_all(
+    std::path::Path::new("sources"),
+    DecompilationMode::Simple,
 )?;
 let batch = session.find_string_references_batch(&[
     "Authorization".to_owned(),
