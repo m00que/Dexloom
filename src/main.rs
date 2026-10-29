@@ -2,7 +2,9 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Write as _,
     fs,
+    io::IsTerminal,
     path::PathBuf,
+    sync::Mutex,
     time::Instant,
 };
 
@@ -13,8 +15,8 @@ use asc_rs::{
     dex::{MemberQuery, Query},
     format_class_name,
     service::{
-        AscSession, DecompilationEngine, DecompilationMode, DecompileOptions, ReferenceLocation,
-        decode_manifest,
+        AscSession, DecompilationEngine, DecompilationMode, DecompileOptions, OperationObserver,
+        OperationStage, ProgressEvent, ReferenceLocation, decode_manifest,
     },
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -429,7 +431,8 @@ fn classes(args: ClassesArgs) -> Result<()> {
 fn decompile_all(args: DecompileAllArgs) -> Result<()> {
     let mode = args.decompilation_mode.unwrap_or(ModeArg::Simple);
     let session = AscSession::open(&args.apk_path, args.common.threads)?;
-    let result = session.decompile_all(&args.output, mode.into())?;
+    let progress = DecompileAllProgress::new();
+    let result = session.decompile_all_with_observer(&args.output, mode.into(), &progress)?;
     match args.common.format {
         OutputFormatArg::Text => {
             println!(
@@ -487,6 +490,80 @@ fn decompile_all(args: DecompileAllArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Stderr progress reporter for `decompile-all`. On a terminal it refreshes
+/// one line per second; redirected stderr gets at most one line every 30
+/// seconds so logs stay readable. Stdout is never touched.
+struct DecompileAllProgress {
+    started: Instant,
+    is_tty: bool,
+    last_emit: Mutex<Option<Instant>>,
+}
+
+impl DecompileAllProgress {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            is_tty: std::io::stderr().is_terminal(),
+            last_emit: Mutex::new(None),
+        }
+    }
+}
+
+fn format_eta(seconds: u64) -> String {
+    let (hours, minutes, secs) = (seconds / 3600, (seconds % 3600) / 60, seconds % 60);
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{secs:02}")
+    } else {
+        format!("{minutes:02}:{secs:02}")
+    }
+}
+
+impl OperationObserver for DecompileAllProgress {
+    fn on_progress(&self, event: &ProgressEvent) {
+        match event.stage {
+            OperationStage::Loading if event.completed == 0 => {
+                eprintln!("Loading DEX files...");
+            }
+            OperationStage::Decompiling if event.total > 0 => {
+                let interval = if self.is_tty { 1 } else { 30 };
+                let finished = event.completed == event.total;
+                let mut last_emit = self.last_emit.lock().expect("progress lock was poisoned");
+                if !finished
+                    && last_emit.is_some_and(|last| last.elapsed().as_secs() < interval)
+                {
+                    return;
+                }
+                *last_emit = Some(Instant::now());
+                let elapsed = self.started.elapsed().as_secs_f64().max(f64::EPSILON);
+                let rate = event.completed as f64 / elapsed;
+                let remaining = if finished || rate <= 0.0 {
+                    0
+                } else {
+                    ((event.total - event.completed) as f64 / rate).ceil() as u64
+                };
+                let line = format!(
+                    "[{:5.1}%] {}/{} classes ({}) {:.0}/s ETA {}",
+                    event.completed as f64 / event.total as f64 * 100.0,
+                    event.completed,
+                    event.total,
+                    event.item.as_deref().unwrap_or("-"),
+                    rate,
+                    format_eta(remaining),
+                );
+                if self.is_tty {
+                    eprint!("\r{line}");
+                    if finished {
+                        eprintln!();
+                    }
+                } else {
+                    eprintln!("{line}");
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn getclass(args: GetClassArgs) -> Result<()> {
@@ -852,6 +929,14 @@ fn write_and_print(text: &str, output: Option<&PathBuf>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eta_formatting_pads_minutes_and_seconds() {
+        assert_eq!(format_eta(0), "00:00");
+        assert_eq!(format_eta(59), "00:59");
+        assert_eq!(format_eta(75), "01:15");
+        assert_eq!(format_eta(3725), "1:02:05");
+    }
 
     #[test]
     fn hex_renderer_includes_absolute_offsets_and_ascii() {
