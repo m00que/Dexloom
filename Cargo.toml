@@ -11,7 +11,7 @@ anyhow = "1"
 adler2 = "2"
 axml-parser = { git = "https://github.com/androguard/axml-parser.git", rev = "dfca90754f0b6933060fd0eaa85720bed58160c1" }
 clap = { version = "4", features = ["derive"] }
-dex-decompiler = { git = "https://github.com/androguard/dex-decompiler.git", rev = "7345cac29985e0536d6105a65ac5c22e2fe6507f" }
+dex-decompiler = { git = "https://github.com/androguard/dex-decompiler.git", rev = "f7fa4a4853d957ebc3c54355d128a3835ef5ae22" }
 flate2 = { version = "1", default-features = false, features = ["zlib"] }
 memmap2 = "0.9"
 rayon = "1"

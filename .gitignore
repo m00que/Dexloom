@@ -1,7 +1,7 @@
 /target/
 /.venv-*/
 /.apk-inspect/
-
+/source/
 # External inputs and generated reverse-engineering artifacts
 *.apk
 *.dex
