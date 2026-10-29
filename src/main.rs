@@ -496,17 +496,23 @@ fn decompile_all(args: DecompileAllArgs) -> Result<()> {
 /// one line per second; redirected stderr gets at most one line every 30
 /// seconds so logs stay readable. Stdout is never touched.
 struct DecompileAllProgress {
-    started: Instant,
     is_tty: bool,
-    last_emit: Mutex<Option<Instant>>,
+    timing: Mutex<ProgressTiming>,
+}
+
+#[derive(Default)]
+struct ProgressTiming {
+    /// Set when the first Decompiling event arrives, so rate and ETA exclude
+    /// the DEX loading phase.
+    phase_start: Option<Instant>,
+    last_emit: Option<Instant>,
 }
 
 impl DecompileAllProgress {
     fn new() -> Self {
         Self {
-            started: Instant::now(),
             is_tty: std::io::stderr().is_terminal(),
-            last_emit: Mutex::new(None),
+            timing: Mutex::new(ProgressTiming::default()),
         }
     }
 }
@@ -529,28 +535,36 @@ impl OperationObserver for DecompileAllProgress {
             OperationStage::Decompiling if event.total > 0 => {
                 let interval = if self.is_tty { 1 } else { 30 };
                 let finished = event.completed == event.total;
-                let mut last_emit = self.last_emit.lock().expect("progress lock was poisoned");
+                let mut timing = self.timing.lock().expect("progress lock was poisoned");
+                let phase_start = *timing.phase_start.get_or_insert_with(Instant::now);
                 if !finished
-                    && last_emit.is_some_and(|last| last.elapsed().as_secs() < interval)
+                    && timing
+                        .last_emit
+                        .is_some_and(|last| last.elapsed().as_secs() < interval)
                 {
                     return;
                 }
-                *last_emit = Some(Instant::now());
-                let elapsed = self.started.elapsed().as_secs_f64().max(f64::EPSILON);
-                let rate = event.completed as f64 / elapsed;
-                let remaining = if finished || rate <= 0.0 {
-                    0
+                timing.last_emit = Some(Instant::now());
+                let phase_elapsed = phase_start.elapsed().as_secs_f64();
+                let (rate_text, eta_text) = if phase_elapsed < 1.0 {
+                    ("--".to_owned(), "--:--".to_owned())
                 } else {
-                    ((event.total - event.completed) as f64 / rate).ceil() as u64
+                    let rate = event.completed as f64 / phase_elapsed;
+                    let remaining = if finished || rate <= 0.0 {
+                        0
+                    } else {
+                        ((event.total - event.completed) as f64 / rate).ceil() as u64
+                    };
+                    (format!("{rate:.0}/s"), format_eta(remaining))
                 };
                 let line = format!(
-                    "[{:5.1}%] {}/{} classes ({}) {:.0}/s ETA {}",
+                    "[{:5.1}%] {}/{} classes ({}) {} ETA {}",
                     event.completed as f64 / event.total as f64 * 100.0,
                     event.completed,
                     event.total,
                     event.item.as_deref().unwrap_or("-"),
-                    rate,
-                    format_eta(remaining),
+                    rate_text,
+                    eta_text,
                 );
                 if self.is_tty {
                     eprint!("\r{line}");
